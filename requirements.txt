@@ -1,0 +1,18 @@
+# Preprocessing (preprocessing/preprocess_ocmr.py)
+numpy
+pandas
+h5py
+sigpy
+scikit-image
+torch
+Pillow
+tqdm
+ismrmrd
+ismrmrd-python-tools
+
+# Flow-matching prior (flow_prior/)
+PyYAML
+
+# EDA notebook (eda/example_ocmr.ipynb)
+matplotlib
+jupyter

@@ -1,0 +1,85 @@
+# CardioFlow Phase 2 -- flow-matching prior on OCMR cine.
+# Every value here is also settable from the CLI:
+#   python train.py --data_dir D:/path/to/processed --epochs 500
+#   python train.py --set train.lr=1e-4 --set model.num_res_blocks=4
+#   python train.py --resume exps/20260916-1200   # continues that run, keeps its config
+
+data:
+  # Directory holding ocmr_train/ ocmr_val/ ocmr_test_gro_XX/ (preprocessing output).
+  data_dir: /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed
+  key: reconstruction_weighted # complex coil-combined reference -> 2 channels
+  frames: 12 # temporal slab length
+  # H, W -- must be divisible by 2^(len(channel_mult)-1), i.e. 8. Width 104 (=8*13) is
+  # chosen so no slice ever needs zero-padding: the narrowest image in the fs pool is
+  # 108px wide, and 35 of 194 train slices are narrower than 128. Heights are all >=144.
+  # This is a crop (a sub-region at native pixel size), never a resize.
+  crop: [128, 104]
+  # What each clip is divided by: max | std | percentile (see dataset.py `_scale`).
+  # Measured on the pilot slices (2026-09-17), clip std and the resulting t at which
+  # signal overtakes the unit-variance flow noise, t = 1/(1+std):
+  #   max        -> std 0.065  crossover t 0.94   (94% of the trajectory is noise)
+  #   percentile -> std 0.152  crossover t 0.87
+  #   std        -> std 0.78   crossover t 0.56   <- chosen
+  # 'std' also keeps a sane dynamic range (p99.9 ~ 4 sigma, max ~ 5-7 sigma) and is
+  # recoverable at Phase 3 inference, where abs_max does not exist: the zero-filled
+  # RSS std is 0.44x the fully-sampled std, stable to ~4% across files and R=8..20.
+  normalize: std
+  normalize_percentile: 99.0 # only used when normalize: percentile
+  num_workers: 0 # h5py + Windows workers can be flaky; raise on Linux
+  augment:
+    random_temporal_start: true # wraps around the cardiac cycle
+    random_crop: true
+    crop_heart_prob: 0.5 # this often anchor on the heart; else uniform over the FOV
+    crop_jitter: 16 # +/- px of translation around the heart anchor
+    # Off by default: a left-right flip produces anatomically implausible hearts
+    # (dextrocardia). Turn on only if the small training pool demands it.
+    flip: false
+
+model:
+  in_channels: 2
+  out_channels: 2
+  model_channels: 32
+  channel_mult: [1, 2, 4, 4]
+  num_res_blocks: 2 # PDDR used 4; 2 is safer for ~194 training clips
+  dropout: 0.0
+
+flow:
+  time_scale: 1000.0 # maps t in [0,1] onto the sinusoidal embedding range
+
+train:
+  # 194 train clips / batch_size 2 / grad_accum 2 -> ~48 optimizer steps per epoch.
+  # 1000 epochs matches the old 50000-step budget; early_stop_patience will usually
+  # cut this short once val loss plateaus (see memory: dataset_ocmr_sizing for why
+  # the train pool is this small and overfitting is a real risk).
+  epochs: 1000
+  batch_size: 8
+  grad_accum: 2
+  lr: 2.0e-4
+  grad_clip: 1.0
+  scheduler: cosine # cosine | step | none -- all resume-safe (see build_scheduler)
+  warmup_epochs: 50 # linear LR warmup, in epochs
+  lr_min_factor: 0.05 # cosine floor, as a fraction of lr
+  lr_step_epochs: 300 # scheduler: step only -- epochs between LR drops
+  lr_gamma: 0.1 # scheduler: step only -- multiplier at each drop
+  amp: true
+  ema_decay: 0.995
+  ema_start_epoch: 40
+  val_every: 10 # epochs between validation passes
+  val_batches: null # batches per validation pass (null = whole split)
+  val_t_bins: 8 # fixed t values per clip -> low-variance val loss
+  early_stop_patience: 150 # epochs without val improvement before stopping
+  seed: 42
+  device: cuda
+
+eval:
+  sample_steps: 50 # Euler steps for the ODE sampler
+  num_samples: 4 # unconditional clips to generate
+  restore_t: [0.3, 0.5, 0.7] # partial-noise restoration sanity checks
+  restore_clips: null # clips to average restoration PSNR/SSIM over (null = whole split)
+  gif_fps: 10
+
+output:
+  # Relative paths anchor to this config file's directory, not the shell's cwd, so runs
+  # land in flow_prior/output/<timestamp>/ however train.py was launched.
+  exp_root: output
+  name: null # optional suffix on the run directory name
