@@ -13,6 +13,9 @@ ismrmrd-python-tools
 # Flow-matching prior (flow_prior/)
 PyYAML
 
+# Zero-shot k-t sampler (zero_shot/) -- everything else it needs is already above
+torchvision
+
 # EDA notebook (eda/example_ocmr.ipynb)
 matplotlib
 jupyter

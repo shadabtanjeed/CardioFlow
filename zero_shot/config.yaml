@@ -1,0 +1,93 @@
+# CardioFlow Phase 3 -- zero-shot k-t reconstruction with the trained flow prior.
+# Every value here is settable from the CLI:
+#   python sampler.py --acceleration 12 --correction_noise shared
+#   python sampler.py --set sampler.ode_steps=128 --set data.limit=5
+#   python evaluate.py --set ablation.accelerations=[8,12,16,20]
+
+prior:
+  # INPUT, read-only: a flow_prior run directory -- only checkpoints/<checkpoint>
+  # is actually read (the config it was trained with is embedded in the .pt file
+  # itself, so nothing else under this directory is required).
+  # Relative paths anchor to this config file's directory.
+  checkpoint_dir: ../flow_prior/output/20260917-062808_prior-v1
+  checkpoint: best.pt # which FILE under checkpoint_dir/checkpoints/ -- best.pt | last.pt
+  weights: ema # ema | model -- ema matches how flow_prior scored the run
+
+data:
+  # Directory holding ocmr_test_gro_XX/ and coil_sens/ (preprocessing output).
+  data_dir: /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed
+  acceleration: 8 # which ocmr_test_gro_XX split to reconstruct (8 | 12 | 16 | 20)
+  limit: null # reconstruct only the first N clips (null = the whole split)
+  # multicoil -- the real inverse problem: measured multi-coil k-space + ESPIRiT maps.
+  #              This is the setting CineVN's published numbers are for.
+  # combined   -- single-coil simulation: the same k-t mask applied to the
+  #              coil-combined reference. Mask fusion is then an exact orthogonal
+  #              projection, so it isolates the noise ablation from coil-model error.
+  coil_mode: multicoil
+  max_frames: null # truncate the clip to N frames (null = all 19). Valid in both modes.
+  crop: null # [H, W] image crop -- combined mode only (see data.py). Mostly for smoke tests.
+  # How to recover the scale the prior trained at, without a fully-sampled reference.
+  #   auto      -- std(zero-filled) / a per-R constant measured from the test split
+  #   constant  -- same, with data.scale_constant supplied explicitly
+  #   reference -- ORACLE, reads the ground truth. Debug only: use it to tell
+  #                "the scale estimate is off" apart from "the sampler is wrong".
+  scale_mode: auto
+  scale_constant: null # only used when scale_mode: constant
+
+sampler:
+  # Restora-Flow's defaults for masked problems are ode_steps 32-64, correction 1.
+  ode_steps: 64
+  correction_steps: 1 # backward jumps per level; 0 disables trajectory correction entirely
+
+  # --- the contribution -------------------------------------------------------
+  # Which noise a trajectory-correction reset draws (see noise.py):
+  #   shared      -- one draw broadcast across all frames  (CardioFlow)
+  #   independent -- a separate draw per frame             (naive per-frame port)
+  # This is the single line the headline ablation flips.
+  correction_noise: shared
+  # Held at 'independent' (Restora-Flow's behaviour) so the ablation varies one
+  # thing at a time. Worth sweeping separately once the headline result is in.
+  fusion_noise: independent
+  init_noise: independent # noise the walk starts from at t=0
+
+  # Off by default: Restora-Flow has no final projection onto the measured data,
+  # and leaving it off keeps this a faithful port. Standard practice in MRI
+  # reconstruction is to enable it; expect a small PSNR gain.
+  final_dc: false
+
+  seed: 42
+  device: cuda
+  # Off by default. Training could afford fp16 because the loss averages over a
+  # batch and EMA smooths what survives; sampling cannot -- a single fp16 velocity
+  # step feeds straight into the next one, and 190 chained Euler steps accumulate
+  # whatever error or overflow it introduces. Correctness first; turn it on with
+  # --amp true once a run has been checked against an fp32 one.
+  amp: false
+  progress: true
+
+ablation:
+  # evaluate.py sweeps these and writes a comparison table + plots.
+  accelerations: [8, 12, 16, 20]
+  correction_noise: [shared, independent]
+  # Also run correction_steps=0 (no trajectory correction at all) as a floor, so
+  # the table shows both "does correction help" and "does sharing the noise help".
+  include_no_correction: true
+
+output:
+  # OUTPUT, writable: parent folder for this run's own timestamped result folders.
+  dir: output
+  name: null # optional suffix on the run directory name
+  # Per clip: the 3-row comparison PNG, the y-t temporal profile, and one GIF each
+  # for reconstruction / reference / zero-filled (all windowed identically).
+  save_clips: true
+  gif_fps: 10
+  # Raw complex arrays as HDF5, so metrics and figures can be recomputed without
+  # re-running the sampler -- far cheaper than the disk it costs. ~7.2 MB per clip
+  # (measured on a real 19-frame, 256x208 clip); combined with save_clips above,
+  # the full default is ~11 MB/clip, ~5 GB for a full 456-clip sweep.
+  save_arrays: true
+  # Also store the reference and zero-filled recon in each clip's HDF5 (3x the
+  # size). Off by default because they are pure duplication across a sweep: the
+  # reference is identical in every cell and the zero-filled recon varies only
+  # with R, never with the arm. Turn on for a one-off run you want self-contained.
+  save_array_inputs: false
