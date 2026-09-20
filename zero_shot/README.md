@@ -3,9 +3,14 @@
 Reconstructs undersampled cine MRI by steering the trained `flow_prior` with the
 measured k-space. It is Restora-Flow's algorithm (Hadzic et al., WACV 2026;
 [imigraz/Restora-Flow](https://github.com/imigraz/Restora-Flow)) moved from static
-pixel-space masks into **k-t space**, plus the one change this project exists to test.
+pixel-space masks into **k-t space**, plus an ablation on how the trajectory-correction
+noise is drawn across frames.
 
 Nothing is trained here. The prior is loaded from a `flow_prior` run and frozen.
+
+The adaptation works: trajectory correction is worth **+6.6 dB PSNR at R=20**. The
+shared-noise idea the project set out to test does not -- see
+[Ablation result](#ablation-result-shared-noise-does-not-help).
 
 ## The algorithm
 
@@ -28,22 +33,24 @@ trajectory off-distribution.
 straight to `t = 1`, then re-noises that estimate back to an earlier time and re-walks
 the stretch, so earlier errors get a second chance.
 
-### The contribution
+### The ablation
 
 Restora-Flow restores single images, so its reset draws `randn_like(x)`. Applied
-frame-by-frame to a cine clip that draws an **independent** noise field per frame:
-the anatomy barely changes between frames but each frame is pushed a different way,
-and the reconstruction flickers. CardioFlow draws **one** field and broadcasts it
-across frames (`noise.py`). Everything else is identical, which makes the two modes a
-clean A/B:
+frame-by-frame to a cine clip that draws an **independent** noise field per frame. The
+hypothesis this project was built on was that doing so would push each frame a different
+way and make the reconstruction flicker, and that drawing **one** field and broadcasting
+it across frames (`noise.py`) would fix that. Everything else is identical, which makes
+the two modes a clean A/B:
 
 ```bash
 python evaluate.py --checkpoint_dir ../flow_prior/output/<run> --data_dir <processed>
 ```
 
-Read the **temporal** metrics first, not PSNR/SSIM. `ablation.include_no_correction` adds
-a `correction_steps=0` floor, so the table answers both "does correction help at all" and
-"does sharing the noise help".
+`ablation.include_no_correction` adds a `correction_steps=0` floor, so the table answers
+both "does correction help at all" and "does sharing the noise help".
+
+> **The hypothesis did not survive contact with the data.** See
+> [Ablation result](#ablation-result-shared-noise-does-not-help) below before building on it.
 
 ## Metrics
 
@@ -70,23 +77,94 @@ well, so they overstate quality; the ROI numbers track diagnostic content.
 artefact the shared-noise correction targets. `bg_flicker` is temporal standard deviation
 *outside* the heart, so unlike `ttv_ratio` it cannot be confounded by genuine cardiac motion.
 
-### Why the temporal metrics are the ones to read
+### Why the temporal metrics are worth reporting
 
-Injecting noise of identical magnitude into a real clip, differing only in whether it is
-drawn per-frame or shared across frames:
+Spatial metrics can be structurally blind to temporal artefacts. Injecting noise of
+identical magnitude directly into a finished clip, differing only in whether it is drawn
+per-frame or shared across frames, moves SSIM by 0.002 while `bg_flicker` moves 6x:
 
 | | SSIM | SSIM_XT | bg_flicker | ttv_ratio |
 |---|---|---|---|---|
-| independent (flickers) | 0.3884 | 0.2982 | 0.644 | 7.96 |
-| shared (temporally coherent) | 0.3902 | 0.3750 | 0.104 | 0.98 |
+| independent | 0.3884 | 0.2982 | 0.644 | 7.96 |
+| shared | 0.3902 | 0.3750 | 0.104 | 0.98 |
 
-SSIM is identical to three decimal places. Spatial metrics are structurally blind to this
-artefact, so an evaluation built only on PSNR/SSIM would miss the contribution entirely
-even if it worked perfectly.
+**This test does not describe the sampler, and it should not be read as motivation for
+the shared-noise idea.** It adds noise to an already-finished image with no network in
+the loop. The real algorithm injects noise at time `t` and then *denoises it* over the
+remaining ODE steps (63 resets at a mean noise weight of 0.5 under the defaults), so the
+artefact this table shows never reaches the output. Taking it as evidence that
+per-frame noise causes flicker in the reconstruction was the project's central
+methodological error -- the measured result below is the opposite.
+
+Keep the table only for what it does establish: PSNR/SSIM alone cannot adjudicate a
+temporal claim, so `bg_flicker`, `ttv_ratio` and `ssim_xt` are worth carrying.
 
 `ssim_xt` needs at least 7 frames (SSIM's window must fit the time axis) and a `center`
 landmark inside the image; it is omitted rather than faked when either is unavailable,
 which is why it does not appear in short `--max_frames` smoke runs.
+
+## Ablation result: shared noise does not help
+
+Run `20260920-045106_ktflow-v1_ablation` -- all 38 test clips x R in {8,12,16,20} x
+{no-correction, shared, independent}, `coil_mode: multicoil`, `scale_mode: auto` (no
+oracle), `seed: 42`, 76 min on one GPU.
+
+**`independent` beats `shared` on every metric at every acceleration**, including the
+temporal ones the shared draw was meant to win:
+
+| R | PSNR shared -> indep | SSIM shared -> indep | bg_flicker shared -> indep | SSIM_XT shared -> indep |
+|---|---|---|---|---|
+| 8 | 37.50 -> **38.89** | 0.924 -> **0.952** | 0.0820 -> **0.0797** | 0.911 -> **0.936** |
+| 12 | 34.08 -> **36.12** | 0.873 -> **0.935** | 0.1007 -> **0.0825** | 0.835 -> **0.903** |
+| 16 | 31.52 -> **34.29** | 0.819 -> **0.919** | 0.1259 -> **0.0884** | 0.757 -> **0.865** |
+| 20 | 29.41 -> **32.57** | 0.760 -> **0.900** | 0.1560 -> **0.1045** | 0.683 -> **0.822** |
+
+Systematic, not outlier-driven: `independent` wins SSIM on **38/38 clips at all four
+accelerations**, and the gap widens with R. At R=8 the *temporal* metrics are close to a
+tie (bg_flicker mean delta -0.0023, 28/38 clips); separation becomes decisive from R=12.
+
+Three explanations were checked and ruled out:
+
+- **Not an implementation bug.** The `[B,C,1,H,W]` draw plus `.expand()` over the frame
+  axis in `noise.py` is correct, and `wiring_check.py`'s three assertions still pass.
+- **Not "shared noise bakes in static hallucination".** Decomposing each arm's error
+  against the reference into a frame-constant and a time-varying part gives a nearly
+  identical split (R=20: shared 54.7% static, independent 58.1%). Shared's error is
+  simply *larger in both components*.
+- **Not oracle leakage.** `scale_mode: auto` throughout; verified in the saved config.
+
+Leading mechanism, **hypothesis only, not yet verified**: the prior trained exclusively
+on `x0 = torch.randn_like(x1)`, i.i.d. across frames. A 3D U-Net's temporal convolutions
+attenuate frame-i.i.d. noise but pass frame-constant noise through at full amplitude, so
+a shared draw arrives at deeper layers far stronger than anything seen in training, and
+the network's temporal-redundancy denoising strategy is exactly the one it defeats. That
+also fits the widening gap: at higher R more of the result leans on the reset than on
+measured data.
+
+### What the run does establish
+
+**Trajectory correction transfers to k-t space and is worth having.** At R=20 it buys
+**+6.6 dB PSNR** (25.93 -> 32.57), lifts SSIM 0.683 -> 0.900 and nearly halves
+background flicker (0.192 -> 0.105) versus `no-correction`. Note that `no-correction` at
+R >= 12 is *worse* than the zero-filled input on `bg_flicker` (0.192 vs 0.110 at R=20):
+correction is what rescues temporal behaviour, just not the sharing of its noise.
+
+One caveat worth tracking: heart-ROI metrics lag the whole-image ones (R=20 independent:
+32.57 global vs 31.54 ROI; for shared, 29.41 vs 26.73), and a few clips post
+`nmse_roi > 1.0`. The background reconstructs better than the diagnostically relevant
+region.
+
+### Open threads
+
+- **No baseline yet.** CineVN has pretrained OCMR/GRO checkpoints at the same four
+  accelerations and these metrics were built to match its definitions; until that
+  comparison exists the absolute numbers cannot be judged.
+- **Single seed.** The 38/38 win rates make the effect unambiguous, but a seed repeat is
+  cheap (~30 min for the two arms that matter at R={12,20}).
+- **Mechanism unverified.** Needs a direct test of the prior's denoising behaviour on
+  frame-shared vs frame-i.i.d. noise.
+- A partial-correlation sweep (`x0 = sqrt(rho)*shared + sqrt(1-rho)*independent`) would
+  turn the negative result into a characterisation for the cost of one sweep.
 
 ## Usage
 
@@ -139,6 +217,31 @@ its size) -- useful for a one-off run you want self-contained, wasteful across a
 where the reference is identical in every cell and the zero-filled recon varies only
 with R.
 
+## Figures
+
+`figure.py` draws the undersampled / reconstruction / ground-truth comparison from a
+finished sweep. It reads the reconstructions already on disk and recomputes the
+reference and zero-filled input from the dataset, so it needs no GPU and no prior.
+
+```bash
+# undersampled -> reconstruction -> ground truth, with a y-t profile column
+python figure.py --ablation_dir <sweep> --data_dir <processed> \
+    --clip fs_0040_3T_slice00 --acceleration 12
+
+# any rows, any order: 'zero_filled', 'reference', or any arm name
+python figure.py ... --order zero_filled,no-correction,shared,independent,reference
+
+# error maps under each reconstruction row
+python figure.py ... --error_maps --error_gain 4
+```
+
+One display choice worth stating in a caption: `A^H y` is the adjoint, not the inverse,
+so its overall brightness is arbitrary and it renders nearly black at the reference's
+window -- which is why the zero-filled row is barely visible in the sampler's own
+per-clip PNGs. `--zf_scale fit` (the default) fits a single least-squares scalar to the
+reference so the row shows aliasing *structure* rather than a brightness mismatch;
+`--zf_scale none` restores the raw adjoint scale.
+
 ## Data facts worth not re-deriving
 
 Established by inspecting the preprocessing output (2026-09-19). Several of these are
@@ -178,7 +281,7 @@ easy to get silently wrong:
 |---|---|
 | `sampler.py` | the sampling loop; CLI for one acceleration |
 | `evaluate.py` | the ablation sweep; CLI for the whole comparison |
-| `noise.py` | shared vs independent noise — **the contribution** |
+| `noise.py` | shared vs independent noise — **the variable the ablation flips** |
 | `mask_fusion.py` | k-space data injection |
 | `trajectory_correction.py` | look-ahead + re-noise reset |
 | `schedule.py` | RePaint-style jump schedule (matches the reference implementation exactly) |
@@ -186,3 +289,4 @@ easy to get silently wrong:
 | `data.py` | loads one clip from the preprocessing output |
 | `prior.py` | loads a frozen `flow_prior` checkpoint |
 | `utils.py` | metrics (incl. temporal flicker) and plots |
+| `figure.py` | publication figures from a finished sweep (no GPU, no prior needed) |
