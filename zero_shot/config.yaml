@@ -15,9 +15,16 @@ prior:
 
 data:
   # Directory holding ocmr_test_gro_XX/ and coil_sens/ (preprocessing output).
+  # This is the split that gets reconstructed and scored -- never read for calibration.
   data_dir: /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed
+  # Directory holding ocmr_val/ and coil_sens/ -- fully sampled, patient-disjoint from
+  # every ocmr_test_gro_* split. Only used when scale_mode: auto, to calibrate the
+  # zero-filled scale constant (see calibration.py); never scored, never reconstructed.
+  # Can be the same root as data_dir if it also has ocmr_val/, or a separate directory.
+  val_data_dir: /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed
   acceleration: 8 # which ocmr_test_gro_XX split to reconstruct (8 | 12 | 16 | 20)
   limit: null # reconstruct only the first N clips (null = the whole split)
+  calib_limit: null # calibrate scale_mode: auto on only the first N ocmr_val clips (null = all)
   # multicoil -- the real inverse problem: measured multi-coil k-space + ESPIRiT maps.
   #              This is the setting CineVN's published numbers are for.
   # combined   -- single-coil simulation: the same k-t mask applied to the
@@ -27,8 +34,10 @@ data:
   max_frames: null # truncate the clip to N frames (null = all 19). Valid in both modes.
   crop: null # [H, W] image crop -- combined mode only (see data.py). Mostly for smoke tests.
   # How to recover the scale the prior trained at, without a fully-sampled reference.
-  #   auto      -- std(zero-filled) / a per-R constant measured from the test split
-  #   constant  -- same, with data.scale_constant supplied explicitly
+  #   auto      -- std(zero-filled) / a ratio calibrated fresh from ocmr_val, on the fly,
+  #                every run (calibration.py). The real setting -- never touches data_dir.
+  #   constant  -- same, with data.scale_constant supplied explicitly (e.g. to reuse a
+  #                ratio calibration.py already logged, without recalibrating).
   #   reference -- ORACLE, reads the ground truth. Debug only: use it to tell
   #                "the scale estimate is off" apart from "the sampler is wrong".
   scale_mode: auto

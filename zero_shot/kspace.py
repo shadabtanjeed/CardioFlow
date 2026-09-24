@@ -18,23 +18,6 @@ complex image, so that is the domain every operator here maps into and out of.
 
 import torch
 
-# Measured on the local test split (12 files x 4 accelerations, 2026-09-19):
-# std of the zero-filled reconstruction divided by std of the fully-sampled
-# reference, using the same `std over stacked (real, imag)` that
-# flow_prior/dataset.py uses to normalise training clips.
-#
-# Two corrections to the single 0.44 constant recorded earlier, which does not
-# reproduce:
-#   1. The ratio is NOT acceleration-independent -- it falls steadily as R rises,
-#      so one pooled constant would be off by up to 20%.
-#   2. It differs by coil mode, because the multicoil adjoint loses energy to
-#      aliasing that the single-coil projection does not.
-# Within one (mode, R) cell it is stable to 2-7%, which is what makes it usable.
-ZERO_FILLED_SCALE = {
-    'multicoil': {8: 0.3202, 12: 0.2587, 16: 0.2235, 20: 0.1969},  # +/- 6-7%
-    'combined': {8: 0.4933, 12: 0.4019, 16: 0.3475, 20: 0.3064},   # +/- 2-4%
-}
-
 
 def fft2c(x: torch.Tensor) -> torch.Tensor:
     """Centred orthonormal 2D FFT over the last two axes."""
@@ -155,21 +138,23 @@ class KTOperator:
 
 def estimate_scale(
     zero_filled: torch.Tensor,
-    acceleration: int,
-    mode: str = 'auto',
+    mode: str = 'constant',
     constant: float | None = None,
     reference: torch.Tensor | None = None,
-    coil_mode: str = 'multicoil',
 ) -> torch.Tensor:
     """
     The divisor that puts this clip on the scale the prior was trained at.
 
     Training divided each clip by `complex_std(fully_sampled_reference)`, which
-    does not exist in the zero-shot setting. `auto` recovers it from the measured
-    data alone via the per-R constants in ZERO_FILLED_SCALE.
+    does not exist in the zero-shot setting.
 
-      auto      -- complex_std(zero_filled) / ZERO_FILLED_SCALE[R]   (the real setting)
-      constant  -- same, but with an explicit ratio supplied by the caller
+      constant  -- complex_std(zero_filled) / `constant`, an explicit ratio
+                   supplied by the caller. This is what `data.scale_mode: auto`
+                   resolves to at run time: `calibration.calibrate_scale` measures
+                   the ratio fresh from `ocmr_val` (never from the split being
+                   scored) and the caller substitutes it in here as `constant`,
+                   so this function itself never needs to know which mode
+                   produced the number.
       reference -- complex_std(fully-sampled reference). ORACLE: only valid for
                    debugging, since it reads data the sampler is not allowed to see.
                    Useful for separating "the scale estimate is off" from "the
@@ -182,20 +167,10 @@ def estimate_scale(
 
     if mode == 'constant':
         if constant is None:
-            raise ValueError("scale mode 'constant' needs data.scale_constant.")
-        ratio = constant
-    elif mode == 'auto':
-        table = ZERO_FILLED_SCALE.get(coil_mode)
-        if table is None:
-            raise ValueError(f'No scale table for coil_mode {coil_mode!r}.')
-        if acceleration not in table:
             raise ValueError(
-                f'No measured zero-filled scale constant for R={acceleration} in '
-                f'{coil_mode} mode; known: {sorted(table)}. Pass '
-                f'--set data.scale_mode=constant --set data.scale_constant=<ratio> instead.'
+                "scale mode 'constant' needs data.scale_constant "
+                "(data.scale_mode=auto should have resolved this already -- see calibration.py)."
             )
-        ratio = table[acceleration]
-    else:
-        raise ValueError(f'Unknown data.scale_mode {mode!r}; expected auto, constant, reference.')
+        return complex_std(zero_filled) / constant
 
-    return complex_std(zero_filled) / ratio
+    raise ValueError(f'Unknown data.scale_mode {mode!r}; expected constant or reference.')

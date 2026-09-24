@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from calibration import calibrate_scale
 from config import build_parser, resolve_config, save_config
 from data import find_files, load_clip
 from kspace import (
@@ -94,17 +95,15 @@ def reconstruct(flow, clip: dict, cfg: dict, device: torch.device, generator=Non
 
     zero_filled = operator.zero_filled(observation)
 
-    # The constants in ZERO_FILLED_SCALE were calibrated on the zero-filled recon
-    # cropped to the reference FOV, so crop before measuring or the statistic
-    # includes oversampled columns the reference does not have.
+    # calibration.calibrate_scale measures its ratio on the zero-filled recon
+    # cropped to the reference FOV, so crop before measuring here too, or the
+    # statistic includes oversampled columns the reference does not have.
     target = tuple(clip['reference'].shape[-2:])
     scale = estimate_scale(
         center_crop(zero_filled, target),
-        acceleration=clip['acceleration'],
         mode=data_cfg['scale_mode'],
         constant=data_cfg.get('scale_constant'),
         reference=clip['reference'].to(device) if data_cfg['scale_mode'] == 'reference' else None,
-        coil_mode=data_cfg['coil_mode'],
     )
     observation = observation / scale
 
@@ -186,6 +185,24 @@ def run(cfg: dict, out_dir: Path, flow=None, prior_info: dict | None = None,
 
     data_cfg = cfg['data']
     files = find_files(Path(data_cfg['data_dir']), data_cfg['acceleration'], data_cfg['limit'])
+
+    # `auto` is resolved here, once per run (not per clip): calibrate fresh from
+    # ocmr_val, then mutate data_cfg in place so `reconstruct()` -- and the saved
+    # `metrics.json['config']`, which shares this same dict -- see plain
+    # `constant` mode with the value actually used. evaluate.py pre-resolves this
+    # itself (once per acceleration, cached across arms) before calling `run`, so
+    # this branch only fires for a standalone `sampler.py` invocation.
+    if data_cfg['scale_mode'] == 'auto':
+        scale_value, n_calib = calibrate_scale(
+            Path(data_cfg['val_data_dir']), data_cfg['acceleration'], data_cfg['coil_mode'],
+            device, limit=data_cfg.get('calib_limit'),
+        )
+        data_cfg['scale_mode'] = 'constant'
+        data_cfg['scale_constant'] = scale_value
+        data_cfg['calibration_n_clips'] = n_calib
+        if not quiet:
+            print(f'Scale (auto)   : {scale_value:.4f}  (calibrated on {n_calib} ocmr_val '
+                  f'clips, R={data_cfg["acceleration"]}, {data_cfg["coil_mode"]})')
 
     if not quiet:
         print(f'Prior          : {prior_info["checkpoint"]}')

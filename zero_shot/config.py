@@ -29,15 +29,17 @@ DEFAULT_CONFIG = Path(__file__).parent / 'config.yaml'
 
 # Flags whose value is always a literal string, never parsed as a Python literal.
 RAW_STRING_FLAGS = {
-    'data_dir', 'output', 'name', 'device', 'checkpoint_dir', 'checkpoint', 'weights',
-    'coil_mode', 'correction_noise', 'fusion_noise', 'init_noise', 'scale_mode',
+    'data_dir', 'val_data_dir', 'output', 'name', 'device', 'checkpoint_dir', 'checkpoint',
+    'weights', 'coil_mode', 'correction_noise', 'fusion_noise', 'init_noise', 'scale_mode',
 }
 
 # CLI flag -> dotted config path.
 SHORTCUTS = {
     'data_dir': 'data.data_dir',
+    'val_data_dir': 'data.val_data_dir',
     'acceleration': 'data.acceleration',
     'limit': 'data.limit',
+    'calib_limit': 'data.calib_limit',
     'coil_mode': 'data.coil_mode',
     'max_frames': 'data.max_frames',
     'scale_mode': 'data.scale_mode',
@@ -105,7 +107,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
 
 def resolve_relative_paths(cfg: dict, base: Path) -> None:
     """Anchor relative paths to the config file's directory, not the shell's cwd."""
-    for dotted in ('data.data_dir', 'output.dir', 'prior.checkpoint_dir'):
+    for dotted in ('data.data_dir', 'data.val_data_dir', 'output.dir', 'prior.checkpoint_dir'):
         try:
             value = get_by_path(cfg, dotted)
         except KeyError:
@@ -155,6 +157,18 @@ def validate(cfg: dict) -> dict:
         raise SystemExit(
             'prior.checkpoint_dir is required: point it at a flow_prior run directory '
             '(--checkpoint_dir).'
+        )
+    if data_cfg['scale_mode'] == 'auto' and not data_cfg.get('val_data_dir'):
+        raise SystemExit(
+            'data.scale_mode=auto calibrates the zero-filled scale from ocmr_val at run '
+            'time (see calibration.py) and needs data.val_data_dir -- a root directory '
+            'containing ocmr_val/ and coil_sens/ (--val_data_dir).'
+        )
+    if data_cfg['scale_mode'] == 'constant' and data_cfg.get('scale_constant') is None:
+        raise SystemExit(
+            'data.scale_mode=constant needs data.scale_constant '
+            '(--set data.scale_constant=<ratio>), or use scale_mode=auto to calibrate it '
+            'from ocmr_val instead.'
         )
     return cfg
 

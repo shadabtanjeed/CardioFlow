@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from calibration import calibrate_scale
 from config import build_parser, resolve_config, save_config
 from data import find_files
 from prior import load_prior
@@ -100,6 +101,13 @@ def sweep(cfg: dict, out_dir: Path) -> dict:
           f'= {len(cells)} runs')
     print(f'Clips per run  : {cfg["data"]["limit"] or "all"}\n')
 
+    # `auto` is calibrated once per distinct acceleration in the sweep -- not once
+    # per cell -- since the ratio depends on (acceleration, coil_mode) only, and
+    # coil_mode is fixed for the whole sweep. Every arm at a given R then reuses the
+    # same value, exactly as `run()` would if it resolved `auto` itself per cell;
+    # this just avoids recomputing it `len(sweep_arms)` times over.
+    scale_cache: dict[int, tuple[float, int]] = {}
+
     results: dict = {}
     started = time.time()
     # Weighted by network-call count, not by cell count: a no-correction cell makes
@@ -121,6 +129,20 @@ def sweep(cfg: dict, out_dir: Path) -> dict:
         cell_cfg['sampler']['correction_steps'] = arm['correction_steps']
         cell_cfg['sampler']['correction_noise'] = arm['correction_noise']
         cell_cfg['sampler']['progress'] = False
+
+        if cell_cfg['data']['scale_mode'] == 'auto':
+            if acceleration not in scale_cache:
+                scale_cache[acceleration] = calibrate_scale(
+                    Path(cfg['data']['val_data_dir']), acceleration, cfg['data']['coil_mode'],
+                    device, limit=cfg['data'].get('calib_limit'),
+                )
+                value, n_calib = scale_cache[acceleration]
+                outer.write(f'  calibrated scale for R={acceleration}: {value:.4f} '
+                            f'(from {n_calib} ocmr_val clips)')
+            value, n_calib = scale_cache[acceleration]
+            cell_cfg['data']['scale_mode'] = 'constant'
+            cell_cfg['data']['scale_constant'] = value
+            cell_cfg['data']['calibration_n_clips'] = n_calib
 
         cell_dir = out_dir / f'R{acceleration:02d}_{label}'
         cell_dir.mkdir(parents=True, exist_ok=True)

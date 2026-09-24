@@ -131,7 +131,10 @@ Three explanations were checked and ruled out:
   against the reference into a frame-constant and a time-varying part gives a nearly
   identical split (R=20: shared 54.7% static, independent 58.1%). Shared's error is
   simply *larger in both components*.
-- **Not oracle leakage.** `scale_mode: auto` throughout; verified in the saved config.
+- **Not *per-clip* oracle leakage.** `scale_mode: auto` throughout; verified in the
+  saved config. (This run predates the fix below, though: its `auto` constants were
+  measured on the test split itself -- a real, if less severe, leak. See
+  [Scale calibration](#scale-calibration).)
 
 Leading mechanism, **hypothesis only, not yet verified**: the prior trained exclusively
 on `x0 = torch.randn_like(x1)`, i.i.d. across frames. A 3D U-Net's temporal convolutions
@@ -165,20 +168,75 @@ region.
   frame-shared vs frame-i.i.d. noise.
 - A partial-correlation sweep (`x0 = sqrt(rho)*shared + sqrt(1-rho)*independent`) would
   turn the negative result into a characterisation for the cost of one sweep.
+- **Rerun since the scale-calibration fix.** The table above used the old
+  test-calibrated `ZERO_FILLED_SCALE` table (see below); it should be regenerated with
+  the current `auto` mode before it goes in the paper. A 5-clip spot check put the new
+  ratio within ~2-3% of the old one (R=8: 0.3284 vs 0.3202; R=12: 0.2630 vs 0.2587), so
+  the ranking is very unlikely to move, but "very unlikely" is not "confirmed."
+
+## Scale calibration
+
+`data.scale_mode: auto` needs a divisor that recovers the scale `flow_prior` trained
+at (`complex_std(fully_sampled_reference)`) from the measured data alone -- see
+`kspace.estimate_scale`'s docstring. That divisor used to be a hardcoded
+`(coil_mode, R)` lookup table in `kspace.py`, and its own comment said what it was:
+*"measured on the local test split"* -- the same clips the headline numbers above are
+scored on. Not the `scale_mode: reference` per-clip oracle (that was correctly never
+used for a reported number), but a subtler, population-level version of the same
+problem: a constant derived from the test split's ground truth, baked in, then applied
+back to that split.
+
+The fix (`calibration.py`) measures the same ratio fresh, every run, from `ocmr_val`
+instead -- confirmed patient-disjoint from every `ocmr_test_gro_*` split (0 overlap
+in patient IDs). `ocmr_val` is fully sampled and stores no mask, so `gro.py` generates
+one on the fly with the same GRO generator the real preprocessing used. That generator
+is a deterministic function of `(num_frames, num_cols, acceleration)` only -- no
+randomness, no need to have run the actual ISMRMRD preprocessing pipeline -- verified
+byte-identical against the stored test masks for several subjects and matrix sizes
+before relying on it. `data.py::load_clip` and `find_files` grew a `split`/`acceleration`
+path so the same loading and masking code serves both `ocmr_test_gro_*` (mask already
+stored) and `ocmr_val` (mask generated) without duplication.
+
+Point `--val_data_dir` at a root containing `ocmr_val/` and `coil_sens/` (can be the
+same root as `--data_dir`, or a separate, smaller one -- see
+[What a phase-3 data folder needs](#what-a-phase-3-data-folder-needs)). `sampler.py`
+calibrates once per run; `evaluate.py` calibrates once per distinct acceleration in the
+sweep and reuses it across arms, since the ratio depends on `(acceleration, coil_mode)`
+only. The resolved value and how many val clips it came from are both printed and
+recorded in the run's `metrics.json`/`ablation.json`, so every reported number carries
+its own calibration provenance instead of a shared, silent constant.
 
 ## Usage
 
 ```bash
-# one acceleration, whole split
-python sampler.py --checkpoint_dir ../flow_prior/output/<run> --data_dir <processed> --acceleration 8
+# one acceleration, whole split -- --val_data_dir is only read for scale_mode: auto
+# calibration (ocmr_val), --data_dir is the test split that actually gets scored
+python sampler.py --checkpoint_dir ../flow_prior/output/<run> \
+    --data_dir <processed> --val_data_dir <processed> --acceleration 8
 
-# the full ablation sweep (R x noise mode), one prior load
-python evaluate.py --checkpoint_dir ../flow_prior/output/<run> --data_dir <processed>
+# the full ablation sweep (R x noise mode), one prior load, one calibration per R
+python evaluate.py --checkpoint_dir ../flow_prior/output/<run> \
+    --data_dir <processed> --val_data_dir <processed>
 ```
 
-Every value in `config.yaml` is settable from the CLI, exactly as in `flow_prior`:
-short flags for the common ones (`--acceleration`, `--ode_steps`, `--correction_noise`,
-`--limit`, `--device`, ...) and `--set any.nested.key=value` for the rest.
+`--data_dir` and `--val_data_dir` can point at the same root (if it has both
+`ocmr_test_gro_*/` and `ocmr_val/`) or at two different ones -- see
+[What a phase-3 data folder needs](#what-a-phase-3-data-folder-needs) for the minimal
+folder that has exactly what both need and nothing else. Every value in `config.yaml`
+is settable from the CLI, exactly as in `flow_prior`: short flags for the common ones
+(`--acceleration`, `--ode_steps`, `--correction_noise`, `--limit`, `--calib_limit`,
+`--device`, ...) and `--set any.nested.key=value` for the rest.
+
+## What a phase-3 data folder needs
+
+Phase 3 only ever touches three things under a processed-data root: `ocmr_val/`
+(calibration only, via `--val_data_dir`), `ocmr_test_gro_{08,12,16,20}/` (the split
+actually reconstructed and scored, via `--data_dir`), and `coil_sens/<id>/` for
+whichever subject IDs appear in those two splits. It never reads `ocmr_train`,
+`ocmr_recons`, or `logs` — those exist only for `flow_prior` training and its own
+sanity-checking. A folder that has exactly this (see `OCMR_data_processed_phase3`
+next to the full `OCMR_data_processed`) is enough to run `sampler.py`/`evaluate.py`
+end to end, at roughly half the size of the full preprocessing output.
 
 ## What a run writes
 
@@ -258,12 +316,17 @@ easy to get silently wrong:
   operation ever sees a distorted grid.
 - **ESPIRiT maps satisfy `sum_c |S_c|^2 = 1` exactly**, so `sum_c conj(S_c) x_c` is the
   properly normalised SENSE adjoint and `A = M.F.S` needs no extra division.
-- **The training scale is recoverable, but not with one constant.** The prior trained on
-  std-normalised clips; that std does not exist at inference. `ZERO_FILLED_SCALE` holds
-  ratios measured per `(coil_mode, R)` — a single pooled constant is off by up to 20%,
-  because the ratio falls steadily with R and differs by coil mode. The multicoil estimate
-  lands within 3% of the oracle. `data.scale_mode=reference` is an oracle escape hatch for
-  telling "the scale estimate is off" apart from "the sampler is wrong".
+- **The training scale is recoverable, but not with one constant, and not from test.**
+  The prior trained on std-normalised clips; that std does not exist at inference, and a
+  single pooled constant across R is off by up to 20% (the ratio falls steadily with R
+  and differs by coil mode) — so it is calibrated per `(coil_mode, R)`, fresh from
+  `ocmr_val`, every run. See [Scale calibration](#scale-calibration).
+  `data.scale_mode=reference` is a separate, per-clip oracle escape hatch for telling
+  "the scale estimate is off" apart from "the sampler is wrong" — never used for a
+  reported number.
+- **`ocmr_val`'s `kspace` is fully sampled, unlike the test folders' — no stored `mask`.**
+  It was only ever prepped as flow-prior training/validation data. `gro.py` masks it
+  on the fly for calibration; nothing in phase 3 reconstructs or scores it.
 
 ## Coil modes
 
@@ -286,7 +349,9 @@ easy to get silently wrong:
 | `trajectory_correction.py` | look-ahead + re-noise reset |
 | `schedule.py` | RePaint-style jump schedule (matches the reference implementation exactly) |
 | `kspace.py` | FFT, SENSE forward/adjoint, padding/cropping, scale estimation |
-| `data.py` | loads one clip from the preprocessing output |
+| `gro.py` | GRO undersampling mask, generated on the fly (used to mask `ocmr_val` for calibration) |
+| `calibration.py` | measures `data.scale_mode: auto`'s scale ratio from `ocmr_val`, on the fly |
+| `data.py` | loads one clip from the preprocessing output (`ocmr_test_gro_*`, already masked, or `ocmr_val`, masked on the fly) |
 | `prior.py` | loads a frozen `flow_prior` checkpoint |
 | `utils.py` | metrics (incl. temporal flicker) and plots |
 | `figure.py` | publication figures from a finished sweep (no GPU, no prior needed) |

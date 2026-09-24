@@ -23,6 +23,7 @@ cd zero_shot
 python sampler.py \
   --checkpoint_dir ../flow_prior/output/20260917-062808_prior-v1 \
   --data_dir /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed \
+  --val_data_dir /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed \
   --acceleration 8 --name ktflow-v1
 
 ```
@@ -34,6 +35,7 @@ cd zero_shot
 python evaluate.py \
   --checkpoint_dir ../flow_prior/output/20260917-062808_prior-v1 \
   --data_dir /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed \
+  --val_data_dir /media/ndag/newVolume/ocmr_dataset/ocmr_cine/OCMR_data_processed \
   --name ktflow-v1
 
 ```
@@ -42,8 +44,20 @@ Sweeps R={8,12,16,20} x {no-correction, independent, shared}, 38 clips each.
 76 min on one GPU, ~5 GB of output at the default save settings. Every
 config.yaml key is CLI-settable (`--set a.b=c`).
 
-Only the test split and the coil sensitivities are needed -- not `ocmr_train`,
-`ocmr_val` or `ocmr_recons`.
+Needs the test split, `ocmr_val` (calibration only -- see below, never scored),
+and the coil sensitivities for both -- not `ocmr_train` or `ocmr_recons`. See
+`zero_shot/README.md#what-a-phase-3-data-folder-needs`;
+`F:\Dataset\OCMR\OCMR_data_processed_phase3` is exactly that subset.
+
+**`--data_dir` and `--val_data_dir` are two different roles, even when you pass the
+same path for both.** `--data_dir` is the split that gets reconstructed and scored.
+`--val_data_dir` is read only to calibrate `data.scale_mode: auto`'s zero-filled scale
+constant, from `ocmr_val` -- patient-disjoint from every `ocmr_test_gro_*` split -- and
+is never reconstructed or scored itself. Before 2026-09-21 this constant
+(`kspace.ZERO_FILLED_SCALE`) was a hardcoded table measured on the test split itself,
+which is a real (population-level, not per-clip) leak; `zero_shot/calibration.py` now
+recomputes it fresh from val on every run instead. See
+`zero_shot/README.md#scale-calibration`.
 
 ### To draw the figures:
 

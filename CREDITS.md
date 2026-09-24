@@ -45,7 +45,11 @@ rates R=8/12/16/20.
   (MatLab), reached via CineVN's Python port
   (`src/sampling_patterns/dynamic/gro.py`)
 - Used for: `gro_sampling_pattern()` and `GROParam` in
-  `preprocessing/preprocess_ocmr.py`
+  `preprocessing/preprocess_ocmr.py`, and vendored a second time (pure NumPy only,
+  no sigpy/ismrmrd import cost) in `zero_shot/gro.py`, which generates the same
+  mask on the fly for `ocmr_val` at phase-3 scale-calibration time (see
+  `zero_shot/README.md#scale-calibration`) -- verified byte-identical to the
+  preprocessing output.
 - License: Ohio State University academic license — free for educational,
   research, and not-for-profit use with attribution retained (full notice is
   in the source file above `gro_sampling_pattern()`). Note the underlying
